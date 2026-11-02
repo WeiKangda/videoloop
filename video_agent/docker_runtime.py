@@ -1,3 +1,4 @@
+# Modified from upstream VideoLoop for the Video-Index pilot; see docs/video_index_pilot.md.
 """
 Docker Runtime for Video Understanding Agent
 Manages the sandbox container for video processing
@@ -27,6 +28,8 @@ class DockerRuntime:
     Manages a Docker container for video processing operations.
     """
 
+    video_mounted = False  # True when /videos/<name> is already there, so nothing needs copying
+
     def __init__(
         self,
         image: str = "video-understanding-sandbox:latest",
@@ -36,6 +39,9 @@ class DockerRuntime:
         volumes: Optional[List[Dict[str, str]]] = None,
         environment: Optional[Dict[str, str]] = None,
         timeout: int = 300,
+        network_disabled: bool = False,
+        cpuset_cpus: Optional[str] = None,
+        name: Optional[str] = None,
     ):
         self.image = image
         self.gpu = gpu
@@ -44,7 +50,10 @@ class DockerRuntime:
         self.volumes = volumes or []
         self.environment = environment or {}
         self.timeout = timeout
-        
+        self.network_disabled = network_disabled
+        self.cpuset_cpus = cpuset_cpus
+        self.name = name
+
         self.client = docker.from_env()
         self.container: Optional[Container] = None
         
@@ -72,7 +81,15 @@ class DockerRuntime:
             ]
         
         logger.info(f"Starting container: {self.image}")
-        
+
+        optional = {}
+        if self.network_disabled:
+            optional["network_mode"] = "none"
+        if self.cpuset_cpus:
+            optional["cpuset_cpus"] = self.cpuset_cpus
+        if self.name:
+            optional["name"] = self.name
+
         self.container = self.client.containers.run(
             self.image,
             command="sleep infinity",
@@ -84,6 +101,7 @@ class DockerRuntime:
             environment=self.environment,
             device_requests=device_requests,
             working_dir="/testbed",
+            **optional,
         )
         
         # Wait for container to be ready

@@ -1,3 +1,4 @@
+# Modified from upstream VideoLoop for the Video-Index pilot; see docs/video_index_pilot.md.
 """
 Orchestrated Memory: ManifestEntry, StepManifest, FilesystemContextAssembler, MemoryOrchestrator.
 
@@ -1585,7 +1586,7 @@ class MemoryOrchestrator:
             else:
                 # Budget exhausted — extract text from last response
                 if raw is None:
-                    raw = (msg.content or "").strip()
+                    raw = (content or "").strip()
                     logger.warning(
                         f"[Orchestrator] Agentic loop exhausted budget ({loop_count} iterations)"
                     )

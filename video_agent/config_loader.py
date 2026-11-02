@@ -1,3 +1,4 @@
+# Modified from upstream VideoLoop for the Video-Index pilot; see docs/video_index_pilot.md.
 """
 Configuration loader for Video Understanding Agent.
 Loads prompts, tools, and settings from YAML files in the configs directory.
@@ -67,12 +68,21 @@ def get_system_prompt(max_images: int = 32) -> str:
     return template.replace("{max_images}", str(max_images))
 
 
-def get_task_prompt(video_path: str, question: str, options_text: str = None, thinking: bool = False, open_ended: bool = False) -> str:
+def option_letters_text(n: int = 0) -> str:
+    """The first n option letters in words, e.g. "A, B, C, or D". Fewer than 2 options reads as A-D."""
+    letters = [chr(65 + i) for i in range(n if n >= 2 else 4)]
+    if len(letters) == 2:
+        return " or ".join(letters)
+    return ", ".join(letters[:-1]) + f", or {letters[-1]}"
+
+
+def get_task_prompt(video_path: str, question: str, options_text: str = None, thinking: bool = False, open_ended: bool = False, option_letters: str = None) -> str:
     """Get the formatted task prompt for the agent.
 
     Args:
         thinking: If True, use thinking-model prompt that encourages step-by-step reasoning.
         open_ended: If True, use open-ended prompt (no multiple-choice options).
+        option_letters: The option letters in words (default "A, B, C, or D").
     """
     prompts = get_prompts()
     task_prompts = prompts.get("task_prompt", {})
@@ -81,7 +91,8 @@ def get_task_prompt(video_path: str, question: str, options_text: str = None, th
         template = task_prompts.get(f"open_ended{suffix}", task_prompts.get("open_ended", ""))
         return template.format(video_path=video_path, question=question)
     template = task_prompts.get(f"multiple_choice{suffix}", task_prompts.get("multiple_choice", ""))
-    return template.format(video_path=video_path, question=question, options_text=options_text or "")
+    return template.format(video_path=video_path, question=question, options_text=options_text or "",
+                           option_letters=option_letters or option_letters_text())
 
 
 def get_no_tool_call_message() -> str:
@@ -90,7 +101,7 @@ def get_no_tool_call_message() -> str:
     return prompts.get("reminders", {}).get("no_tool_call", "")
 
 
-def get_iteration_warning(steps_remaining: int, max_iterations: int = 50) -> str:
+def get_iteration_warning(steps_remaining: int, max_iterations: int = 50, option_letters: str = None) -> str:
     """Get the appropriate iteration warning based on steps remaining.
     
     R3: More aggressive thresholds — warnings start at 50% budget used,
@@ -118,7 +129,7 @@ def get_iteration_warning(steps_remaining: int, max_iterations: int = 50) -> str
         # Last 5% — final
         template = warnings.get("final", "FINAL STEP")
     
-    return template.format(steps_remaining=steps_remaining)
+    return template.format(steps_remaining=steps_remaining, option_letters=option_letters or option_letters_text())
 
 
 def get_tool_loop_nudge(loop_tool: str, used_tools: List[str], recent_tools: List[str]) -> str:

@@ -1,3 +1,4 @@
+# Modified from upstream VideoLoop for the Video-Index pilot; see docs/video_index_pilot.md.
 """
 Tool handler registry for the Video Understanding Agent.
 
@@ -16,6 +17,7 @@ import subprocess
 import tempfile
 
 from .logging_utils import get_logger
+from .message_utils import shrink_image
 
 logger = get_logger(__name__)
 
@@ -88,8 +90,8 @@ def _extract_clip_frames(clip_path: str, fps: float = 1.0) -> list:
 _VALID_IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 
 
-def _frames_to_base64(local_frame_paths: list, max_frames: int = 8) -> list:
-    """Convert local frame image files to base64 data URLs."""
+def _frames_to_base64(local_frame_paths: list, max_frames: int = 8, max_long_side: int = None) -> list:
+    """Convert local frame image files to base64 data URLs, shrinking any over max_long_side."""
     urls = []
     for fpath in local_frame_paths[:max_frames]:
         try:
@@ -97,15 +99,18 @@ def _frames_to_base64(local_frame_paths: list, max_frames: int = 8) -> list:
             if ext not in _VALID_IMAGE_EXTS:
                 logger.warning(f"Skipping non-image file: {fpath}")
                 continue
-            file_size = os.path.getsize(fpath)
-            if file_size > 5 * 1024 * 1024:  # 5MB guard
-                logger.warning(f"Skipping oversized file ({file_size/1024/1024:.1f}MB): {fpath}")
-                continue
             with open(fpath, "rb") as fh:
                 data = fh.read()
             mime = {"jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png"}.get(
                 ext.lstrip("."), "image/jpeg"
             )
+            if max_long_side:
+                data, shrunk_mime = shrink_image(data, max_long_side)
+                mime = shrunk_mime or mime
+            file_size = len(data)
+            if file_size > 5 * 1024 * 1024:  # 5MB guard
+                logger.warning(f"Skipping oversized file ({file_size/1024/1024:.1f}MB): {fpath}")
+                continue
             b64 = base64.b64encode(data).decode()
             urls.append(f"data:{mime};base64,{b64}")
         except Exception as e:
@@ -155,6 +160,22 @@ def _transcribe_audio(agent, input_data):
 MAX_FRAMES_PER_BATCH = 64  # Max frames sent to the model in a single visual-analysis call
 
 
+def _split_frame_batches(image_urls: list, frame_paths: list, max_count: int, max_mb: float = None) -> list:
+    """Split frames into (urls, paths) batches of at most max_count frames and max_mb MB of base64."""
+    max_chars = max_mb * 1024 * 1024 if max_mb else float("inf")
+    batches, urls, paths, chars = [], [], [], 0
+    for i, url in enumerate(image_urls):
+        if urls and (len(urls) >= max_count or chars + len(url) > max_chars):
+            batches.append((urls, paths))
+            urls, paths, chars = [], [], 0
+        urls.append(url)
+        paths.extend(frame_paths[i:i + 1])
+        chars += len(url)
+    if urls:
+        batches.append((urls, paths))
+    return batches
+
+
 @_register("analyze_frames")
 def _analyze_frames(agent, input_data):
     frame_paths = input_data.get("frame_paths") or input_data.get("image_paths", [])
@@ -178,7 +199,8 @@ def _analyze_frames(agent, input_data):
     if getattr(agent, '_multimodal_agent', False):
         # Native multimodal: return images directly, agent analyzes with full memory context
         # Split into batches of MAX_FRAMES_PER_BATCH to stay under 16-image API limit
-        image_urls = _frames_to_base64(local_frames, max_frames=len(local_frames))
+        image_urls = _frames_to_base64(local_frames, max_frames=len(local_frames),
+                                       max_long_side=getattr(agent, '_max_image_long_side', None))
         if image_urls:
             # Cache base64 by Docker path for render_context
             if not hasattr(agent, '_frame_b64_cache'):
@@ -190,7 +212,9 @@ def _analyze_frames(agent, input_data):
             question = input_data.get("question", "Describe what you observe.")
 
             # Split into batches
-            if len(image_urls) <= MAX_FRAMES_PER_BATCH:
+            batches = _split_frame_batches(image_urls, frame_paths, MAX_FRAMES_PER_BATCH,
+                                           getattr(agent, '_max_batch_mb', None))
+            if len(batches) <= 1:
                 # Single batch — return directly
                 return _make_multimodal_result(
                     f"[{len(image_urls)} frames attached. {question}]",
@@ -198,12 +222,6 @@ def _analyze_frames(agent, input_data):
                 )
             else:
                 # Multiple batches — store remaining on agent for sequential processing
-                batches = []
-                for i in range(0, len(image_urls), MAX_FRAMES_PER_BATCH):
-                    batch_urls = image_urls[i:i + MAX_FRAMES_PER_BATCH]
-                    batch_paths = frame_paths[i:i + MAX_FRAMES_PER_BATCH]
-                    batches.append((batch_urls, batch_paths))
-
                 # Store remaining batches for _process_response to handle
                 if not hasattr(agent, '_pending_frame_batches'):
                     agent._pending_frame_batches = []
@@ -217,7 +235,7 @@ def _analyze_frames(agent, input_data):
 
                 logger.info(
                     f"[FrameBatch] Split {len(image_urls)} frames into {len(batches)} batches "
-                    f"({MAX_FRAMES_PER_BATCH} per batch, {len(agent._pending_frame_batches)} pending)"
+                    f"(up to {MAX_FRAMES_PER_BATCH} per batch, {len(agent._pending_frame_batches)} pending)"
                 )
 
                 # Return first batch

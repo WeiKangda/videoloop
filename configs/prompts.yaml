@@ -1,3 +1,4 @@
+# Modified from upstream VideoLoop for the Video-Index pilot; see docs/video_index_pilot.md.
 # Video Understanding Agent - Prompts Configuration
 # All system prompts, instance prompts, and message templates
 
@@ -92,7 +93,7 @@ task_prompt:
     Options:
     {options_text}
 
-    Analyze the video and select the correct answer (A, B, C, or D).
+    Analyze the video and select the correct answer ({option_letters}).
     Use submit_answer with your final answer letter and reasoning.
 
   # Thinking model prompts — encourage step-by-step reasoning
@@ -106,7 +107,7 @@ task_prompt:
     {options_text}
 
     Please reason step-by-step: identify relevant visual content, analyze key timestamps and clues,
-    and then provide the final answer (A, B, C, or D) via submit_answer.
+    and then provide the final answer ({option_letters}) via submit_answer.
     For any calculations or formula applications, use execute_bash to run Python — do not compute in your head.
 
   # Open-ended questions — no predefined options, submit the computed value
@@ -151,7 +152,7 @@ iteration_warnings:
   soon: "Steps Remaining: {steps_remaining} - You have used over half your budget. If you have visual AND transcript evidence, call submit_answer now."
   warning: "⚠️ Steps Remaining: {steps_remaining} - Stop gathering new evidence. Review what you have and call submit_answer with your best answer."
   urgent: "🚨 URGENT: Only {steps_remaining} steps left! Call submit_answer NOW. Pick the best option from your evidence and submit immediately."
-  final: "🚨 FINAL STEP: You MUST call submit_answer NOW. Do not call any other tool. Pick A, B, C, or D and submit."
+  final: "🚨 FINAL STEP: You MUST call submit_answer NOW. Do not call any other tool. Pick {option_letters} and submit."
 
 # ==============================================================================
 # TOOL LOOP DETECTION NUDGE

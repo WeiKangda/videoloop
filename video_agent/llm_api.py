@@ -1,3 +1,4 @@
+# Modified from upstream VideoLoop for the Video-Index pilot; see docs/video_index_pilot.md.
 """Shared LLM API helpers.
 
 Provides:
@@ -7,14 +8,17 @@ Provides:
 Both return the same normalized dict format so callers can switch freely.
 """
 
+import importlib
 import json
 import logging
 import os
 import random
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 import httpx
+
+from .message_utils import messages_api_view
 
 logger = logging.getLogger(__name__)
 
@@ -30,10 +34,82 @@ _NON_TRANSIENT = (
     "inappropriate content",
     "token count exceeds", "exceeds the maximum number of tokens",
     "too many images",
+    "input is too long", "prompt is too long", "invalid_request_error", "validationexception",
 )
 
 _EMPTY_RESULT = {"content": "", "thinking_content": "", "tool_calls": [],
                  "finish_reason": "stop", "usage": {}}
+
+_usage_sink: Optional[Callable[[Dict], None]] = None
+
+
+def set_usage_sink(sink: Optional[Callable[[Dict], None]]) -> None:
+    """Call ``sink(record)`` after every openai_completion call.
+
+    Unlike TokenTracker this sees every call, including ones no caller records,
+    so it is the one to use for cost.
+    """
+    global _usage_sink
+    _usage_sink = sink
+
+
+def _report_usage(tag: str, model: str, result: Optional[Dict] = None, error: str = "") -> None:
+    if _usage_sink is None:
+        return
+    usage = (result or {}).get("usage") or {}
+    _usage_sink({
+        "tag": tag,
+        "model": model,
+        "input_tokens": usage.get("promptTokenCount", 0) or 0,
+        "output_tokens": (usage.get("candidatesTokenCount", 0) or 0) + (usage.get("thoughtsTokenCount", 0) or 0),
+        "cache_read_tokens": usage.get("cacheReadTokenCount", 0) or 0,
+        "cache_write_tokens": usage.get("cacheWriteTokenCount", 0) or 0,
+        "finish_reason": (result or {}).get("finish_reason", ""),
+        "error": error[:300],
+        "t": time.time(),
+    })
+
+
+def _normalize_openai_usage(usage: Dict) -> Dict:
+    """Usage in gemini_completion's shape. promptTokenCount includes cached tokens."""
+    details = usage.get("prompt_tokens_details") or {}
+    read = usage.get("cache_read_input_tokens") or details.get("cached_tokens") or 0
+    write = usage.get("cache_creation_input_tokens") or details.get("cache_creation_tokens") or 0
+    if "prompt_tokens" in usage:
+        prompt = usage["prompt_tokens"] or 0
+        if prompt < read + write:  # some gateways report only the uncached part here
+            prompt += read + write
+    else:  # Anthropic-style input_tokens never include cached tokens
+        prompt = (usage.get("input_tokens") or 0) + read + write
+    output = usage.get("completion_tokens", usage.get("output_tokens", 0)) or 0
+    return {
+        "promptTokenCount": prompt,
+        "candidatesTokenCount": output,
+        "thoughtsTokenCount": 0,  # Not reported separately in OpenAI format
+        "totalTokenCount": usage.get("total_tokens") or prompt + output,
+        "cacheReadTokenCount": read,
+        "cacheWriteTokenCount": write,
+    }
+
+
+def _load_backend(spec: str) -> Callable[..., Dict]:
+    module, _, name = spec.partition(":")
+    if not module or not name:
+        raise ValueError(f"LLM backend must be 'module:function', got {spec!r}")
+    return getattr(importlib.import_module(module), name)
+
+
+def _call_backend_with_retry(backend: Callable[..., Dict], max_retries: int, **request) -> Dict:
+    """Same retry policy as HTTP, so that a backend can simply raise on a throttle."""
+    for attempt in range(max_retries):
+        try:
+            return backend(**request)
+        except Exception as e:
+            if attempt >= max_retries - 1 or any(kw in str(e).lower() for kw in _NON_TRANSIENT):
+                raise
+            logger.warning(f"Backend retry {attempt+1}/{max_retries}: {str(e)[:200]}")
+            time.sleep(_backoff(attempt))
+    return dict(_EMPTY_RESULT)
 
 
 def strip_provider_prefix(model: str) -> str:
@@ -326,44 +402,49 @@ def openai_completion(
     api_base: str,
     api_key: str,
     max_tokens: int = 8192,
-    temperature: float = 1.0,
+    temperature: Optional[float] = 1.0,
     timeout: float = 60.0,
     tools: Optional[List[Dict]] = None,
     max_retries: int = 8,
     reasoning_effort: Optional[str] = None,
+    tool_choice: Optional[str] = None,
+    usage_tag: str = "orchestrator",
 ) -> Dict:
-    """Call an OpenAI-compatible /chat/completions endpoint.
+    """Call an OpenAI-compatible /chat/completions endpoint, or the configured backend.
 
     Messages should already be in OpenAI format (role/content/tool_calls).
     ``api_base`` may be left empty to use the Gemini API's OpenAI-compatible
     endpoint. ``reasoning_effort`` ("low"/"medium"/"high") controls extended
-    thinking on endpoints that support it.
+    thinking on endpoints that support it. ``tool_choice`` is passed as given;
+    "none" keeps the tools declared but asks for a text reply.
+
+    With a backend (``llm.backend`` or VIDEOLOOP_LLM_BACKEND, "module:function"),
+    that function is called with the keywords model, messages, max_tokens,
+    temperature (None = don't send), timeout, tools, tool_choice, reasoning_effort
+    and extra_body, and returns the dict below.
 
     Returns same dict format as gemini_completion:
         - content: str (response text)
         - thinking_content: str (reasoning, if present)
         - tool_calls: list of tool call dicts
         - finish_reason: str (stop, length, content_filter)
-        - usage: dict (prompt_tokens, completion_tokens, total_tokens)
+        - usage: dict (promptTokenCount, candidatesTokenCount, thoughtsTokenCount,
+          totalTokenCount, cacheReadTokenCount, cacheWriteTokenCount); promptTokenCount
+          includes cached tokens
     """
     from uuid import uuid4
+    from .config import get_config
 
+    settings = get_config().llm
     bare_model = strip_provider_prefix(model)
+    if settings.messages_api_safe:
+        messages = messages_api_view(messages, get_config().main_agent.max_image_long_side)
+    if settings.omit_temperature:
+        temperature = None
 
-    base = (api_base or GEMINI_OPENAI_COMPAT_BASE).rstrip("/")
-    url = f"{base}/chat/completions"
-
-    payload = {
-        "model": bare_model,
-        "messages": messages,
-        "max_tokens": max_tokens,
-        "temperature": temperature,
-    }
-    if reasoning_effort:
-        payload["reasoning_effort"] = reasoning_effort
+    oai_tools = []
     if tools:
         # Normalize tool format
-        oai_tools = []
         for t in tools:
             if "function" in t and "type" in t:
                 oai_tools.append(t)
@@ -375,13 +456,44 @@ def openai_completion(
             elif "function_declarations" in t:
                 for fd in t["function_declarations"]:
                     oai_tools.append({"type": "function", "function": fd})
-        if oai_tools:
-            payload["tools"] = oai_tools
 
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
+    backend = os.environ.get("VIDEOLOOP_LLM_BACKEND") or settings.backend
+    if backend:
+        try:
+            result = _call_backend_with_retry(
+                _load_backend(backend), max_retries,
+                model=bare_model, messages=messages, max_tokens=max_tokens,
+                temperature=temperature, timeout=timeout, tools=oai_tools or None,
+                tool_choice=tool_choice, reasoning_effort=reasoning_effort,
+                extra_body=dict(settings.extra_body),
+            )
+        except Exception as e:
+            _report_usage(usage_tag, bare_model, error=str(e))
+            raise
+        _report_usage(usage_tag, bare_model, result)
+        return result
+
+    base = (api_base or GEMINI_OPENAI_COMPAT_BASE).rstrip("/")
+    url = f"{base}/chat/completions"
+
+    payload = {
+        "model": bare_model,
+        "messages": messages,
+        "max_tokens": max_tokens,
     }
+    if temperature is not None:
+        payload["temperature"] = temperature
+    if reasoning_effort:
+        payload["reasoning_effort"] = reasoning_effort
+    if oai_tools:
+        payload["tools"] = oai_tools
+        if tool_choice:
+            payload["tool_choice"] = tool_choice
+    payload.update(settings.extra_body)
+
+    headers = {"Content-Type": "application/json"}
+    if api_key:  # A local proxy may need none, and "Bearer " alone is an illegal header
+        headers["Authorization"] = f"Bearer {api_key}"
 
     def parse(result):
         choices = result.get("choices", [])
@@ -408,12 +520,13 @@ def openai_completion(
             "tool_calls": tool_calls,
             "finish_reason": choices[0].get("finish_reason", "stop") or "stop",
             # Normalize usage to match gemini_completion format
-            "usage": {
-                "promptTokenCount": usage.get("prompt_tokens", 0),
-                "candidatesTokenCount": usage.get("completion_tokens", 0),
-                "thoughtsTokenCount": 0,  # Not reported separately in OpenAI format
-                "totalTokenCount": usage.get("total_tokens", 0),
-            },
+            "usage": _normalize_openai_usage(usage),
         }
 
-    return _post_with_retry(url, headers, payload, timeout, max_retries, "OpenAI", parse)
+    try:
+        result = _post_with_retry(url, headers, payload, timeout, max_retries, "OpenAI", parse)
+    except Exception as e:
+        _report_usage(usage_tag, bare_model, error=str(e))
+        raise
+    _report_usage(usage_tag, bare_model, result)
+    return result

@@ -1,3 +1,4 @@
+# Modified from upstream VideoLoop for the Video-Index pilot; see docs/video_index_pilot.md.
 """
 API call mixin for VideoUnderstandingAgent.
 
@@ -85,7 +86,7 @@ class APICallMixin:
             "raw_message": None,
         }
 
-    def _call_and_normalize_openai(self, messages, tools):
+    def _call_and_normalize_openai(self, messages, tools, tool_choice=None):
         """Call OpenAI-compatible API via shared openai_completion."""
         from .llm_api import openai_completion
         from .agent import _NormalizedToolCall
@@ -100,6 +101,9 @@ class APICallMixin:
             timeout=self._timeout,
             tools=tools,
             max_retries=8,
+            reasoning_effort=self._reasoning_effort,
+            tool_choice=tool_choice,
+            usage_tag="main_agent",
         )
 
         usage = resp.get("usage", {})
@@ -144,3 +148,13 @@ class APICallMixin:
         if self._use_gemini_native:
             return self._call_and_normalize_gemini_native(messages, tools)
         return self._call_and_normalize_openai(messages, tools)
+
+    def _dispatch_text_only_call(self, messages, tools):
+        """A call that must come back as text, with tool calls already in the history.
+
+        The Messages API rejects tool history when no tools are declared, so
+        there the tools stay declared and tool_choice is "none".
+        """
+        if self._messages_api_safe and not self._use_gemini_native:
+            return self._call_and_normalize_openai(messages, tools, tool_choice="none")
+        return self._dispatch_api_call(messages, None)

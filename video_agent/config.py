@@ -1,3 +1,4 @@
+# Modified from upstream VideoLoop for the Video-Index pilot; see docs/video_index_pilot.md.
 """Configuration loading for the video understanding agent."""
 
 from __future__ import annotations
@@ -30,6 +31,18 @@ class MainAgentConfig:
     thinking_level: Optional[str] = None  # "low"/"high" for models that use thinking levels
     max_images: int = 32  # Max images per visual-analysis call
     multimodal_agent: bool = True  # Native multimodal: frames go directly to the main agent
+    reasoning_effort: Optional[str] = None  # Sent on OpenAI-compatible calls (None = endpoint default)
+    max_image_long_side: Optional[int] = None  # Shrink frames larger than this before sending (None = as extracted)
+    max_batch_mb: Optional[float] = None  # Split an analyze_frames call above this many MB of base64 (None = by count only)
+
+
+@dataclass
+class LLMConfig:
+    """How requests are shaped on the OpenAI-compatible path (main agent and orchestrator)."""
+    backend: str = ""  # "module:function" called instead of HTTP; env VIDEOLOOP_LLM_BACKEND wins
+    omit_temperature: bool = False  # Don't send temperature (newer Claude models reject sampling parameters)
+    messages_api_safe: bool = False  # Only send conversations the Anthropic Messages API accepts
+    extra_body: Dict[str, Any] = field(default_factory=dict)  # Merged into every request
 
 
 @dataclass
@@ -39,6 +52,14 @@ class SandboxConfig:
     gpu: bool = True
     memory_limit: str = "32g"
     shm_size: str = "8g"
+    runtime: str = "docker"  # "docker" or "bwrap"
+    network_disabled: bool = False  # No network inside the sandbox
+    mount_video: bool = False  # Docker: bind-mount the video read-only instead of copying it in
+    cpuset_cpus: Optional[str] = None  # Docker: CPU list for the container
+    container_name: Optional[str] = None  # Docker: name the container so a runner can remove it
+    env_prefix: str = ""  # bwrap: a Python environment, mounted read-only and put first on PATH
+    extra_ro_binds: List[str] = field(default_factory=list)  # bwrap: "SRC" or "SRC:DST" mounted read-only
+    work_root: str = ""  # bwrap: folder for /outputs, /testbed and /tmp ("" = a new temp folder)
 
     @property
     def full_image(self) -> str:
@@ -100,6 +121,7 @@ class VisualPlannerConfig:
 @dataclass
 class AgentConfig:
     main_agent: MainAgentConfig = field(default_factory=MainAgentConfig)
+    llm: LLMConfig = field(default_factory=LLMConfig)
     sandbox: SandboxConfig = field(default_factory=SandboxConfig)
     memory: MemoryConfig = field(default_factory=MemoryConfig)
     pricing: PricingConfig = field(default_factory=PricingConfig)
@@ -129,6 +151,7 @@ class AgentConfig:
         main_agent_data.pop("max_tokens", None)  # Now in models section
         main_agent = MainAgentConfig(**main_agent_data)
 
+        llm = LLMConfig(**data.get("llm", {}))
         sandbox = SandboxConfig(**data.get("sandbox", {}))
         memory = MemoryConfig(**data.get("memory", {}))
         pricing_data = data.get("pricing", {})
@@ -148,6 +171,7 @@ class AgentConfig:
 
         return cls(
             main_agent=main_agent,
+            llm=llm,
             sandbox=sandbox,
             memory=memory,
             pricing=pricing,

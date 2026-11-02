@@ -1,3 +1,4 @@
+# Modified from upstream VideoLoop for the Video-Index pilot; see docs/video_index_pilot.md.
 """
 Main Video Understanding Agent
 
@@ -23,6 +24,7 @@ from .config import get_config, ModelLimits
 from .config_loader import (
     get_system_prompt,
     get_task_prompt,
+    option_letters_text,
     get_no_tool_call_message,
     get_iteration_warning,
     get_forced_answer_message,
@@ -42,12 +44,23 @@ from .token_tracker import TokenTracker
 # (within ~10% across English/code prose); for image_url blocks we add a
 # fixed Gemini per-image cost (258 tokens regardless of resolution, per
 # https://ai.google.dev/gemini-api/docs/tokens).
-try:
-    import tiktoken
-    _TIKTOKEN_ENC = tiktoken.get_encoding("cl100k_base")
-except Exception:  # pragma: no cover - tiktoken should be present
-    _TIKTOKEN_ENC = None
+_TIKTOKEN_ENC = None
+_TIKTOKEN_TRIED = False
 _GEMINI_PER_IMAGE_TOKENS = 258
+
+
+def _tiktoken_encoder():
+    """Loaded on first use: get_encoding downloads its data, which can hang on a
+    restricted network, and only the no-memory mode needs it."""
+    global _TIKTOKEN_ENC, _TIKTOKEN_TRIED
+    if not _TIKTOKEN_TRIED:
+        _TIKTOKEN_TRIED = True
+        try:
+            import tiktoken
+            _TIKTOKEN_ENC = tiktoken.get_encoding("cl100k_base")
+        except Exception:  # pragma: no cover - tiktoken should be present
+            _TIKTOKEN_ENC = None
+    return _TIKTOKEN_ENC
 
 
 def _count_messages_tokens(llm_messages: List[Dict[str, Any]]) -> int:
@@ -57,7 +70,8 @@ def _count_messages_tokens(llm_messages: List[Dict[str, Any]]) -> int:
     `_GEMINI_PER_IMAGE_TOKENS` per `image_url` block. Falls back to a
     chars/4 heuristic if tiktoken isn't available.
     """
-    if _TIKTOKEN_ENC is None:
+    encoder = _tiktoken_encoder()
+    if encoder is None:
         return sum(len(str(m.get("content", ""))) for m in llm_messages) // 4
     text_tokens = 0
     n_images = 0
@@ -65,7 +79,7 @@ def _count_messages_tokens(llm_messages: List[Dict[str, Any]]) -> int:
         content = m.get("content")
         if isinstance(content, str):
             try:
-                text_tokens += len(_TIKTOKEN_ENC.encode(content))
+                text_tokens += len(encoder.encode(content))
             except Exception:
                 text_tokens += len(content) // 4
         elif isinstance(content, list):
@@ -75,15 +89,16 @@ def _count_messages_tokens(llm_messages: List[Dict[str, Any]]) -> int:
                 ptype = p.get("type")
                 if ptype == "text":
                     try:
-                        text_tokens += len(_TIKTOKEN_ENC.encode(p.get("text", "")))
+                        text_tokens += len(encoder.encode(p.get("text", "")))
                     except Exception:
                         text_tokens += len(p.get("text", "")) // 4
                 elif ptype == "image_url":
                     n_images += 1
     return text_tokens + n_images * _GEMINI_PER_IMAGE_TOKENS
 from .docker_runtime import DockerRuntime
+from .bwrap_runtime import BwrapRuntime
 from .transcript_cache import TranscriptCache
-from .tools import format_tools_for_claude, format_tools_for_openai, format_tools_for_gemini
+from .tools import format_tools_for_openai, format_tools_for_gemini
 from .logging_utils import get_logger, console, IS_TTY
 from .message_utils import (
     append_to_content,
@@ -127,6 +142,7 @@ class AgentResult:
     error: Optional[str] = None
     reasoning: Optional[str] = None
     token_usage: Optional[dict] = None
+    answer_source: Optional[str] = None  # submit, forced_submit, text, extracted or default
 
 
 @dataclass
@@ -183,6 +199,7 @@ class _IterationState:
     recent_tools: List[str] = field(default_factory=list)
     answer: Optional[str] = None
     reasoning: Optional[str] = None
+    answer_source: Optional[str] = None  # How state.answer was obtained (see AgentResult)
     overthink_warnings: int = 0  # How many times we've injected an overthink nudge
 
 
@@ -291,6 +308,8 @@ class VideoUnderstandingAgent(APICallMixin):
         self._bare_model = strip_provider_prefix(self.model)
         # Extended thinking comes from config
         self._use_thinking = bool(getattr(cfg.main_agent, 'thinking', False))
+        self._reasoning_effort = cfg.main_agent.reasoning_effort
+        self._messages_api_safe = cfg.llm.messages_api_safe
 
         # Timeout and retry config
         self._timeout = cfg.main_agent.timeout  # seconds
@@ -301,6 +320,8 @@ class VideoUnderstandingAgent(APICallMixin):
 
         # Max images per visual-analysis call (bounds tool schema + payload)
         self.max_images = cfg.main_agent.max_images
+        self._max_image_long_side = cfg.main_agent.max_image_long_side
+        self._max_batch_mb = cfg.main_agent.max_batch_mb
         # Token usage tracking
         self.token_tracker = TokenTracker()
 
@@ -397,11 +418,48 @@ class VideoUnderstandingAgent(APICallMixin):
         inc = self._include_tools or None
         if self._use_gemini_native:
             return format_tools_for_gemini(max_images=self.max_images, include_tools=inc)
-        elif self.provider == "anthropic":
-            return format_tools_for_claude(max_images=self.max_images, include_tools=inc)
         else:
-            # OpenAI-style format works for most providers including Ollama
+            # Everything else goes through openai_completion, Claude models included
             return format_tools_for_openai(max_images=self.max_images, include_tools=inc)
+
+    def _letter_range(self, at_least: int) -> str:
+        """Regex class for the current question's option letters, at least A..at_least letters long."""
+        n = max(len(getattr(self, '_current_options', None) or []), at_least)
+        return f"A-{chr(64 + n)}"
+
+    def _option_letters(self) -> str:
+        """The current question's option letters in words, e.g. "A, B, C, or D"."""
+        return option_letters_text(len(getattr(self, '_current_options', None) or []))
+
+    def _make_runtime(self, video_path: str) -> DockerRuntime:
+        """The sandbox chosen by the sandbox section of the config."""
+        cfg = get_config().sandbox
+        video_exists = Path(video_path).exists()
+        if cfg.runtime == "bwrap":
+            return BwrapRuntime(
+                video_path=video_path if video_exists else None,
+                env_prefix=cfg.env_prefix,
+                extra_ro_binds=cfg.extra_ro_binds,
+                network_disabled=cfg.network_disabled,
+                work_root=cfg.work_root,
+            )
+        volumes = []
+        mount = cfg.mount_video and video_exists
+        if mount:
+            source = os.path.realpath(video_path)
+            volumes.append({"source": source, "target": f"/videos/{Path(video_path).name}", "read_only": True})
+        runtime = DockerRuntime(
+            self.docker_image,
+            gpu=cfg.gpu,
+            memory_limit=cfg.memory_limit,
+            shm_size=cfg.shm_size,
+            volumes=volumes,
+            network_disabled=cfg.network_disabled,
+            cpuset_cpus=cfg.cpuset_cpus,
+            name=cfg.container_name,
+        )
+        runtime.video_mounted = mount
+        return runtime
 
     def _parse_tool_call_from_content(self, content: str) -> Optional[Any]:
         """
@@ -731,10 +789,10 @@ class VideoUnderstandingAgent(APICallMixin):
             return f"Error executing {name}: {str(e)}"
 
     @staticmethod
-    def _extract_answer_from_text(text: str, open_ended: bool = False) -> Optional[str]:
+    def _extract_answer_from_text(text: str, open_ended: bool = False, letters: str = "A-E") -> Optional[str]:
         """Try to extract an answer from free-form text.
 
-        For multiple-choice: extracts a letter (A-D).
+        For multiple-choice: extracts a letter in the ``letters`` range.
         For open-ended: extracts a number or short value.
         """
         import re
@@ -756,21 +814,21 @@ class VideoUnderstandingAgent(APICallMixin):
 
         # Multiple-choice extraction
         # Direct single letter
-        if text.upper() in ("A", "B", "C", "D", "E"):
+        if re.fullmatch(f"[{letters}]", text.upper()):
             return text.upper()
         # Common patterns
         for pat in [
-            r"(?:answer|submit|choice|select)[:\s]+([A-E])\b",
-            r"\b([A-E])\.",
-            r"\b([A-E])\)",
-            r"^([A-E])\b",
-            r"\b([A-E])\s*$",
+            rf"(?:answer|submit|choice|select)[:\s]+([{letters}])\b",
+            rf"\b([{letters}])\.",
+            rf"\b([{letters}])\)",
+            rf"^([{letters}])\b",
+            rf"\b([{letters}])\s*$",
         ]:
             m = re.search(pat, text, re.IGNORECASE)
             if m:
                 return m.group(1).upper()
-        # Last resort: first standalone A-E
-        m = re.search(r"\b([A-E])\b", text)
+        # Last resort: first standalone letter
+        m = re.search(rf"\b([{letters}])\b", text)
         if m:
             return m.group(1).upper()
         return None
@@ -911,9 +969,11 @@ class VideoUnderstandingAgent(APICallMixin):
                 # For open-ended questions, look for numeric or value-based answers
                 explicit = re.search(r'(?:answer\s+is|result\s+is|value\s+is|equals?)[:\s]+([^\s,.]+)', all_text, re.IGNORECASE)
             else:
-                explicit = re.search(r'(?:answer\s+is|submit|choose|select)\s+([A-D])\b', all_text, re.IGNORECASE)
+                # The letter stays case-sensitive: "select a frame" is not an answer
+                letters = self._letter_range(4)
+                explicit = re.search(rf'(?i:answer\s+is|submit|choose|select)\s+([{letters}])\b', all_text)
                 if not explicit:
-                    explicit = re.search(r'\bSo\s+([A-D])[\.\s]', all_text)
+                    explicit = re.search(rf'\bSo\s+([{letters}])[\.\s]', all_text)
 
             # Only auto-extract after multiple no-tool turns — give the model a chance to call submit_answer.
             # Also enforce the same min-iteration / min-VLM-calls gates as submit_answer, so "append-only"
@@ -929,6 +989,7 @@ class VideoUnderstandingAgent(APICallMixin):
                     return "continue"
                 state.answer = explicit.group(1).upper() if not is_open_ended else explicit.group(1)
                 state.reasoning = "Auto-extracted from model response (model stated answer but did not call submit_answer)"
+                state.answer_source = "text"
                 logger.info(f"Auto-extracting answer '{state.answer}' from model text")
                 self._log_step("answer", {"answer": state.answer, "reasoning": state.reasoning})
                 return "break"
@@ -1013,7 +1074,7 @@ class VideoUnderstandingAgent(APICallMixin):
             if state.consecutive_dedup_blocks >= 5:
                 dedup_msg = (
                     "DUPLICATE CALL BLOCKED: You are stuck repeating the same tool calls. "
-                    "You MUST call submit_answer NOW with your best guess. Choose A, B, C, or D."
+                    f"You MUST call submit_answer NOW with your best guess. Choose {self._option_letters()}."
                 )
             messages.append({"role": "tool", "tool_call_id": tc.id, "content": dedup_msg})
             return "continue"
@@ -1095,7 +1156,7 @@ class VideoUnderstandingAgent(APICallMixin):
 
             logger.info(f"[Multimodal] Second LLM call for image analysis ({len(image_parts)} images)")
             # No tools — force the agent to describe what it sees rather than act
-            resp2 = self._dispatch_api_call(llm_messages, None)
+            resp2 = self._dispatch_text_only_call(llm_messages, tools)
 
             # Extract the agent's analysis (no tools = text-only response)
             analysis_text = ""
@@ -1168,7 +1229,8 @@ class VideoUnderstandingAgent(APICallMixin):
                     llm_messages = messages
 
                 logger.info(f"[Multimodal] Second LLM call for batch {batch_num} ({len(batch_urls)} images)")
-                resp_batch = self._dispatch_api_call(llm_messages, None)
+                self._log_step("frame_batch", {"batch": batch_num, "n_images": len(batch_urls)})
+                resp_batch = self._dispatch_text_only_call(llm_messages, tools)
 
                 batch_analysis = ""
                 if resp_batch and isinstance(resp_batch, dict):
@@ -1239,6 +1301,7 @@ class VideoUnderstandingAgent(APICallMixin):
         if tool_name == "submit_answer":
             state.answer = tool_input.get("answer")
             state.reasoning = tool_input.get("reasoning", "")
+            state.answer_source = "submit"
             self._log_step("answer", {"answer": state.answer, "reasoning": state.reasoning})
             return "break"
 
@@ -1282,7 +1345,9 @@ class VideoUnderstandingAgent(APICallMixin):
         # Build list of unmet requirements
         reasons = []
 
-        if cfg.require_transcript_before_submit and not has_transcript:
+        # Nor can a file with no audio track give a transcript
+        needs_transcript = cfg.require_transcript_before_submit and not getattr(self, '_no_audio_stream', False)
+        if needs_transcript and not has_transcript:
             reasons.append(
                 "No transcript obtained yet. Call transcribe_audio to get the video transcript — "
                 "it provides crucial context (names, timestamps, descriptions) that visual analysis alone cannot."
@@ -1295,7 +1360,9 @@ class VideoUnderstandingAgent(APICallMixin):
                 f"Use analyze_clip / analyze_frames / execute_bash to gather more evidence across the video."
             )
 
-        if getattr(cfg, "min_vlm_calls_before_submit", 0) and vlm_calls < cfg.min_vlm_calls_before_submit:
+        # A file with no video stream can't meet this one, however long the agent tries
+        needs_vlm = getattr(cfg, "min_vlm_calls_before_submit", 0) and not getattr(self, '_no_video_stream', False)
+        if needs_vlm and vlm_calls < cfg.min_vlm_calls_before_submit:
             reasons.append(
                 f"You have made {vlm_calls} visual-analysis call(s) so far "
                 f"(analyze_clip / analyze_frames / describe_frames), but at least "
@@ -1320,19 +1387,22 @@ class VideoUnderstandingAgent(APICallMixin):
             ]
         else:
             force_prompts = [
-                "CRITICAL: You MUST call submit_answer NOW with your best guess. Choose A, B, C, or D. Do not explain — just call submit_answer.",
-                "You did NOT call submit_answer. Call it RIGHT NOW. Pick one option letter (one of A, B, C, D, or E if present). Call submit_answer(answer=<letter>, reasoning='forced').",
+                f"CRITICAL: You MUST call submit_answer NOW with your best guess. Choose {self._option_letters()}. Do not explain — just call submit_answer.",
+                f"You did NOT call submit_answer. Call it RIGHT NOW. Pick one option letter (one of {self._option_letters()}). Call submit_answer(answer=<letter>, reasoning='forced').",
                 "FINAL WARNING: If you do not call submit_answer this turn, your answer will be recorded as wrong. Call submit_answer immediately.",
             ]
         last_text = ""
         for attempt, fprompt in enumerate(force_prompts):
             messages.append({"role": "user", "content": fprompt})
             try:
-                resp = self._dispatch_api_call(messages, tools)
+                # The raw history holds every frame seen so far, too many for one Messages API request
+                call_messages = self._strip_old_images(messages, keep_recent=0) if self._messages_api_safe else messages
+                resp = self._dispatch_api_call(call_messages, tools)
                 for tc in resp["tool_calls"]:
                     if tc.name == "submit_answer":
                         state.answer = tc.arguments.get("answer")
                         state.reasoning = tc.arguments.get("reasoning", "")
+                        state.answer_source = "forced_submit"
                         self._log_step("answer", {"answer": state.answer, "reasoning": state.reasoning})
                         return
                 last_text = resp["text_content"] or last_text
@@ -1341,14 +1411,16 @@ class VideoUnderstandingAgent(APICallMixin):
                 logger.warning(f"Force answer attempt {attempt+1}/{len(force_prompts)} failed: {e}")
 
         if not state.answer:
-            extracted = self._extract_answer_from_text(last_text, open_ended=is_open_ended)
+            extracted = self._extract_answer_from_text(last_text, open_ended=is_open_ended, letters=self._letter_range(5))
             if extracted:
                 state.answer = extracted
                 state.reasoning = f"[FORCED] Extracted from model response after {len(force_prompts)} prompts"
+                state.answer_source = "extracted"
                 logger.warning(f"Extracted answer '{state.answer}' from model text")
             else:
                 state.answer = "0" if is_open_ended else "A"
                 state.reasoning = f"[FORCED] Model refused to submit. Defaulting to {'0' if is_open_ended else 'A'}."
+                state.answer_source = "default"
                 logger.warning(f"Could not extract answer — defaulting to {'0' if is_open_ended else 'A'}")
             self._log_step("answer", {"answer": state.answer, "reasoning": state.reasoning})
 
@@ -1397,7 +1469,7 @@ class VideoUnderstandingAgent(APICallMixin):
         for iteration in range(self.max_iterations):
             self.token_tracker.set_iteration(iteration)
             steps_remaining = self.max_iterations - iteration
-            step_msg = get_iteration_warning(steps_remaining, self.max_iterations)
+            step_msg = get_iteration_warning(steps_remaining, self.max_iterations, self._option_letters())
 
             # Append step counter to the last user/tool message
             if messages and messages[-1]["role"] in ("user", "tool"):
@@ -1508,6 +1580,11 @@ class VideoUnderstandingAgent(APICallMixin):
                 self._force_answer(messages, tools, state)
                 break
 
+        # The budget can also run out on a path that skips the force above (a bounced
+        # submit, a blocked duplicate, a turn with no tool call). Ask before guessing.
+        if state.answer is None:
+            self._force_answer(messages, tools, state)
+
         # Post-loop fallback: if answer is still None, scan conversation history
         if state.answer is None:
             is_open_ended = not getattr(self, '_current_options', None)
@@ -1519,14 +1596,16 @@ class VideoUnderstandingAgent(APICallMixin):
                     if isinstance(msg.get("reasoning_content"), str):
                         text_parts.append(msg["reasoning_content"])
             all_text = " ".join(text_parts)
-            extracted = self._extract_answer_from_text(all_text, open_ended=is_open_ended)
+            extracted = self._extract_answer_from_text(all_text, open_ended=is_open_ended, letters=self._letter_range(5))
             if extracted:
                 state.answer = extracted
                 state.reasoning = "[FORCED] Extracted from conversation history"
+                state.answer_source = "extracted"
                 logger.warning(f"Post-loop extraction: '{state.answer}'")
             else:
                 state.answer = "0" if is_open_ended else "A"
                 state.reasoning = f"[FORCED] No answer found anywhere. Defaulting to {'0' if is_open_ended else 'A'}."
+                state.answer_source = "default"
                 logger.warning(f"Post-loop: defaulting to {'0' if is_open_ended else 'A'}")
             self._log_step("answer", {"answer": state.answer, "reasoning": state.reasoning})
 
@@ -1592,7 +1671,8 @@ class VideoUnderstandingAgent(APICallMixin):
                 options_text = "\n".join(options)
             else:
                 options_text = "\n".join(f"{chr(65+i)}. {opt}" for i, opt in enumerate(options))
-            task = get_task_prompt(video_path=video_path, question=question, options_text=options_text, thinking=use_thinking)
+            task = get_task_prompt(video_path=video_path, question=question, options_text=options_text,
+                                   thinking=use_thinking, option_letters=self._option_letters())
         else:
             task = get_task_prompt(video_path=video_path, question=question, thinking=use_thinking, open_ended=True)
 
@@ -1647,14 +1727,15 @@ class VideoUnderstandingAgent(APICallMixin):
         ]
 
         try:
-            with DockerRuntime(self.docker_image) as docker:
+            with self._make_runtime(str(video_path)) as docker:
                 self._docker = docker
 
                 # Copy video to container
                 video_path = Path(video_path)
                 if video_path.exists():
                     container_video_path = f"/videos/{video_path.name}"
-                    docker.copy_to_container(str(video_path), container_video_path)
+                    if not docker.video_mounted:
+                        docker.copy_to_container(str(video_path), container_video_path)
                 else:
                     container_video_path = str(video_path)
                     logger.warning(f"Video file not found locally: {video_path}")
@@ -1695,6 +1776,12 @@ class VideoUnderstandingAgent(APICallMixin):
                     fps = vid.get("fps", "?") if vid else "?"
                     codec = vid.get("codec", "?") if vid else "?"
                     meta_line = f"\nVideo metadata: {dur}s duration, {res}, {codec}, {fps}fps"
+                    self._no_video_stream = "format" in raw_info and not vid
+                    if self._no_video_stream:
+                        meta_line += "\nThis file has an audio track and no video stream, so there are no frames to analyze; use the transcript."
+                    self._no_audio_stream = "format" in raw_info and "audio" not in _video_info_summary
+                    if self._no_audio_stream:
+                        meta_line += "\nThis video has no audio track, so there is no transcript."
                     messages[1]["content"] = self._append_to_content(messages[1]["content"], meta_line)
                     logger.info(f"Auto-fetched video info:{meta_line.strip()}")
                 except Exception as e:
@@ -1889,6 +1976,7 @@ class VideoUnderstandingAgent(APICallMixin):
                     success=state.answer is not None,
                     reasoning=state.reasoning,
                     token_usage=self.token_tracker.to_dict(),
+                    answer_source=state.answer_source,
                 )
                 
         except Exception as e:

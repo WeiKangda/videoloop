@@ -1,0 +1,72 @@
+# VideoLoop on Video-Index v1.1. See docs/video_index_pilot.md.
+#
+# The memory settings and the tool whitelist are the same as configs/config.yaml
+# (the paper's). What differs: the model comes from the command line, requests are
+# shaped for Claude models (llm), timeouts are longer, frames are capped in size,
+# and the sandbox is bubblewrap with no GPU and no network.
+
+main_agent:
+  model: "set-with---model"
+  max_output_tokens: 65536
+  max_retries: 3
+  timeout: 1200
+  thinking: true           # Selects the step-by-step task prompt
+  reasoning_effort: "max"  # Claude Opus 5.5 defaults to medium when this doesn't reach the model
+  max_images: 32           # Max frames per analyze_frames call
+  multimodal_agent: true
+  max_image_long_side: 2000
+  max_batch_mb: 15
+
+llm:
+  # "module:function" to call Python instead of HTTP, see docs/video_index_pilot.md
+  backend: ""
+  omit_temperature: true
+  messages_api_safe: true
+  # Merged into every HTTP request, or handed to the backend
+  extra_body: {}
+
+memory:
+  enabled: true
+  file_backed: true
+  orchestrated: true
+  max_context_chars: 64000
+  recent_messages_window: 8
+  min_vlm_calls_before_submit: 3
+  min_iterations_before_submit: 6
+  require_transcript_before_submit: true
+  temporal_radius: 120.0
+  frame_radius: 60.0
+  summarizer_model: "set-with---model"
+  summarizer_reasoning_effort: "high"
+  summarizer_max_tokens: 32768
+  summarizer_timeout: 600
+  max_narrative_entries: 40
+  max_pinned_entries: 20
+  manifest_max_detailed: 30
+  manifest_compression_batch: 10
+  orchestrator_max_iterations: 5
+  fs_context_budget: 16000
+  max_key_frames: 6
+
+visual_planner:
+  enabled: false
+  descriptions_dir: dataset/videomme_long/visual_descriptions
+  narrative_dir: ""
+  model: null
+  max_tokens: 2048
+
+include_tools:
+  - execute_bash
+  - submit_answer
+  - analyze_frames
+  - transcribe_audio
+
+sandbox:
+  runtime: "bwrap"   # "docker" also works, with the image from docker/build.sh
+  image: "video-understanding-sandbox"
+  tag: "latest"
+  gpu: false
+  memory_limit: "32g"
+  shm_size: "8g"
+  network_disabled: true
+  mount_video: true
