@@ -34,6 +34,8 @@ from .config_loader import (
     get_summarizer_prompts,
     get_orchestrator_prompts,
     get_orchestrated_preamble,
+    get_video_memory_preamble,
+    get_video_memory_orchestrator_note,
 )
 from .memory import MemoryOrchestrator, FilesystemContextAssembler, truncate_tool_output
 from .file_memory import OrchestratedMemory
@@ -98,7 +100,8 @@ def _count_messages_tokens(llm_messages: List[Dict[str, Any]]) -> int:
 from .docker_runtime import DockerRuntime
 from .bwrap_runtime import BwrapRuntime
 from .transcript_cache import TranscriptCache
-from .tools import format_tools_for_openai, format_tools_for_gemini
+from .tools import ALL_TOOLS, format_tools_for_openai, format_tools_for_gemini
+from .video_memory.tool_schemas import VIDEO_MEMORY_TOOL_NAMES
 from .logging_utils import get_logger, console, IS_TTY
 from .message_utils import (
     append_to_content,
@@ -272,6 +275,8 @@ class VideoUnderstandingAgent(APICallMixin):
         self.log_file = log_file
         self.step_callback = step_callback  # Callback: (step_type, content, trajectory) -> None
         self._include_tools = include_tools or cfg.include_tools or []
+        self._base_include_tools = self._include_tools
+        self._video_memory = None  # MemoryToolkit of the current video, if it has a built memory
 
         # Create console for this agent instance (with optional file recording)
         self._console = make_console(log_file)
@@ -422,6 +427,28 @@ class VideoUnderstandingAgent(APICallMixin):
             # Everything else goes through openai_completion, Claude models included
             return format_tools_for_openai(max_images=self.max_images, include_tools=inc)
 
+    def _attach_video_memory(self, video_path) -> bool:
+        """Load the built memory of this video, if it has one, and offer its tools.
+
+        A memory that exists but won't load raises, so that the question fails in the open
+        rather than quietly running without its memory.
+        """
+        self._video_memory = None
+        self._include_tools = self._base_include_tools
+        memory_dir = get_config().video_memory.memory_dir
+        if not memory_dir:
+            return False
+        from .video_memory.loader import GRAPH_FILENAME, load_toolkit
+        folder = Path(memory_dir) / Path(video_path).stem
+        if not (folder / GRAPH_FILENAME).exists():
+            return False
+        self._video_memory = load_toolkit(str(folder))
+        base = self._base_include_tools or [t["function"]["name"] for t in ALL_TOOLS]
+        self._include_tools = list(base) + VIDEO_MEMORY_TOOL_NAMES
+        self._log_step("video_memory", {"macro_events": len(self._video_memory.memory.macro_events),
+                                        "super_events": len(self._video_memory.memory.super_events)})
+        return True
+
     def _letter_range(self, at_least: int) -> str:
         """Regex class for the current question's option letters, at least A..at_least letters long."""
         n = max(len(getattr(self, '_current_options', None) or []), at_least)
@@ -487,6 +514,7 @@ class VideoUnderstandingAgent(APICallMixin):
                 "execute_bash", "create_file",
                 "list_files", "read_file",
                 "pin_memory", "complete_todo",
+                *VIDEO_MEMORY_TOOL_NAMES,
             }
             if func_name in known_tools:
                 args_str = func_match.group(2)
@@ -1741,6 +1769,9 @@ class VideoUnderstandingAgent(APICallMixin):
                     logger.warning(f"Video file not found locally: {video_path}")
                 self._container_video_path = container_video_path
 
+                if self._attach_video_memory(video_path):
+                    self._genre_context = " ".join(filter(None, [self._genre_context, get_video_memory_orchestrator_note()]))
+
                 # Update task with container path
                 messages[1]["content"] = self._replace_in_content(
                     messages[1]["content"], str(video_path), container_video_path
@@ -1940,6 +1971,8 @@ class VideoUnderstandingAgent(APICallMixin):
                         preamble = get_memory_preamble()
                     if preamble:
                         messages[0]["content"] += "\n\n" + preamble
+                if self._video_memory:
+                    messages[0]["content"] += "\n\n" + get_video_memory_preamble()
 
                 # Effective free tools
                 free_tools = FREE_TOOLS

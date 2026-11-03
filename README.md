@@ -1,4 +1,4 @@
-> This fork adds a pilot on Video-Index v1.1, with Claude models and a bubblewrap sandbox. See [docs/video_index_pilot.md](docs/video_index_pilot.md) for the steps and for what changed from upstream.
+> This fork adds a pilot on Video-Index v1.1, with Claude models and a bubblewrap sandbox, and an optional pre-built video memory from Qwen-MM-Plugins. See [docs/video_index_pilot.md](docs/video_index_pilot.md) for the steps and for what changed from upstream.
 
 <h1 align="center">VideoLoop: Looped Working Memory Against Semantic Thrashing in Long-Form Video Agents</h1>
 

@@ -31,7 +31,7 @@ bwrap --ro-bind / / --dev /dev --proc /proc --unshare-net true && echo ok
 
 试跑默认用 bubblewrap，不需要 Docker 服务，也不用构建镜像。沙箱只能看到系统目录、`--env-prefix` 指定的 Python 环境和当前这道题的视频，看不到题目文件。这个环境里有什么包（opencv、PyAV 等），agent 就能用什么。ffmpeg 和 ffprobe 也要在这个环境或系统目录里，否则脚本启动时就会报错。想用论文的 Docker 镜像，把 `configs/config_videoindex.yaml` 里的 `sandbox.runtime` 改成 `docker`，再运行 `docker/build.sh all`。
 
-先跑一遍测试。这一步用假模型，真实走 bubblewrap 和 ffmpeg，大约 1 分钟，不花钱：
+先跑一遍测试。这一步用假模型，真实走 bubblewrap 和 ffmpeg，大约 1 分钟，不花钱。装了第 11 步的依赖后还会测视频记忆，大约 5 分钟：
 
 ```bash
 .venv/bin/python -m pytest tests -q
@@ -192,12 +192,14 @@ $WHISPER_ENV/bin/python scripts/transcribe_videoindex.py --items $ITEMS --videos
 - `video_agent/bwrap_runtime.py`
 - `tests/test_videoindex_pilot.py`、`tests/fake_model_server.py`
 - 这份文档
+- 第 11 步用到的 `scripts/build_video_memory.py`、`video_agent/video_memory/`、`tests/test_video_memory.py`
 
 只在 `config_videoindex.yaml` 这样打开时才生效的改动：
 
 - `llm` 一节：Python 后端、不发 temperature、Messages API 兼容的请求形状、`extra_body`
 - `main_agent` 的 `reasoning_effort`、`max_image_long_side`、`max_batch_mb`
 - `sandbox` 的 `runtime`、`network_disabled`、`mount_video`、`cpuset_cpus`、`container_name` 等
+- `video_memory` 一节和 `--video-memory`：记忆工具、提示词里的 `<VIDEO_MEMORY>`，以及告诉记忆模块这些结果要核实的那句话
 
 在默认配置下也生效的改动，都是修问题：
 
@@ -211,3 +213,80 @@ $WHISPER_ENV/bin/python scripts/transcribe_videoindex.py --items $ITEMS --videos
 - `invalid_request_error`、`input is too long` 这类错误不再重试。
 - 没有密钥时不发 `Authorization` 头。原来空密钥会让请求一直失败。
 - tiktoken 改成第一次用到时才加载。原来每次 import 都可能联网下载，只有无记忆模式才用到。
+
+## 11. 视频记忆（可选）
+
+给长视频提前建一份分层记忆，agent 答题时用 9 个工具查它，定位到时间段后再抽帧核实。代码来自 [Qwen-MM-Plugins](https://github.com/QwenLM/Qwen-MM-Plugins) 的 video-memory（Apache-2.0），放在 `video_agent/video_memory/`，改了什么见那里的 [README](../video_agent/video_memory/README.md)。
+
+不传 `--video-memory` 时，这部分不起任何作用，前面的步骤和结果都不变。所有模型调用走第 4 步接好的同一个接口，不用再接一次。
+
+先把第 5、6 步跑通，再做这一步，否则出错时分不清问题在哪一层。
+
+**准备：**
+
+```bash
+.venv/bin/pip install -e ".[video-memory]"
+```
+
+建库脚本直接调用 ffmpeg 和 ffprobe，它们要在 `PATH` 上。如果只装在 `$TOOLS_ENV` 里，先 `export PATH=$TOOLS_ENV/bin:$PATH`。
+
+**先试 3 个视频。** 这是 30 分钟以上里最短的 3 个，一共约 2 小时。转写要先做好：
+
+```bash
+$WHISPER_ENV/bin/python scripts/transcribe_videoindex.py --items $ITEMS --videos $VIDEOS --model-dir $MODELS/large-v3 --threads 12 --only ViMUL-Bench_4920,Video-MME_2411,Video-MME_2180
+```
+
+```bash
+.venv/bin/python scripts/build_video_memory.py --items $ITEMS --videos $VIDEOS --model $MODEL --api-base $URL --only ViMUL-Bench_4920,Video-MME_2411,Video-MME_2180
+```
+
+每个视频的结果在 `dataset/videoindex_v1_1/video_memory/<视频文件名>/`。先看这些：
+
+- `build_stats.json`：`status` 应该是 `done`，`n_empty_subgraphs` 应该接近 0。`usage` 是每类调用的 token，`wall_s` 是用时，`phase_s` 是每个阶段的用时。
+- `graph_memory.json`：挑一段的 `subgraph` 看看，事件描述对不对，时间对不对得上视频。这一步不能省，假模型测不出建出来的东西好不好。
+
+超过 10% 的段建不出来时，脚本会停在聚合之前并报错。已经建好的段都在磁盘上，同一条命令再跑一次就接着做，不重复花钱。换了模型、帧率这些设置，脚本会拒绝接着做，请换一个 `--out`。
+
+**用记忆答题：**
+
+```bash
+.venv/bin/python scripts/run_videoindex.py --items $ITEMS --videos $VIDEOS --out results/videoindex/memory_smoke --model $MODEL --api-base $URL --env-prefix $TOOLS_ENV --video-memory dataset/videoindex_v1_1/video_memory --only ViMUL-Bench_4920,Video-MME_2411,Video-MME_2180
+```
+
+```bash
+.venv/bin/python scripts/score_videoindex.py --run results/videoindex/memory_smoke --items $ITEMS --video-memory dataset/videoindex_v1_1/video_memory --baseline $BASELINE_CSV
+```
+
+`result.json` 里 `video_memory` 应该是 `true`，`tool_calls` 里应该有 `search_nodes`、`get_subgraph` 这些。如果都是 0，说明 agent 没用记忆，要先看提示词。
+
+**全部 29 个 30 分钟以上的视频，一共 49.6 小时。** 不带 `--only` 时默认只建 30 分钟以上的。可以用 `--shard` 拆开同时跑：
+
+```bash
+for i in 0 1 2 3; do .venv/bin/python scripts/build_video_memory.py --items $ITEMS --videos $VIDEOS --model $MODEL --api-base $URL --shard $i/4 > build_$i.log 2>&1 & done; wait
+```
+
+```bash
+.venv/bin/python scripts/run_videoindex.py --items $ITEMS --videos $VIDEOS --out results/videoindex/memory_long --model $MODEL --api-base $URL --env-prefix $TOOLS_ENV --video-memory dataset/videoindex_v1_1/video_memory --min-duration 1800 --cpu-slots '0-5,48-53;6-11,54-59;12-17,60-65'
+```
+
+带 `--video-memory` 时，30 分钟以上的视频必须有建好的记忆，否则脚本拒绝启动。打分时 `--baseline` 只比两边都有的题，所以这里就是这 29 道题的配对比较。
+
+**费用估算，没有实测过。** 这 29 个视频大约切成 1,100 段。每段约 80 帧，宽 720 像素的 16:9 帧约 390 token，所以输入约 3,500 万 token，按公开价约 150 美元。输出取决于模型写多少，每段 3 千到 1 万 token 的话是 65 到 220 美元。合计大约 200 到 370 美元。先看 3 个视频的 `usage` 再估全量。想省钱可以调低 `--fps` 和 `--max-dim`，也可以用 `--effort` 改 effort，默认 `medium`。用时上游的说法是不用 OSS 时每小时视频约 40 分钟，那是另一个模型，只能参考。
+
+**读结果时要记住：**
+
+- **建库费用要单独看。** `cost_usd`、`wall_s` 只算答题。建库在 `build_cost_usd`、`build_wall_s`，两者相加在 `cost_with_build_usd`、`wall_with_build_s`。这里每个视频只有一道题，建库费用全落在这一道题上，没有摊薄。LVBench 这种每个视频多道题的数据集不一样。
+- **限时不含建库。** 3,600 秒只算答题。
+- **默认只有 BM25。** 也就是按词匹配，换一种说法就可能搜不到。上游默认是向量加 BM25。要接向量，写一个函数放在 `PYTHONPATH` 上，建库和答题时都设置 `VIDEOLOOP_EMBED_BACKEND=my_embed:embed`。这部分没有用真实的向量模型测过。
+
+  ```python
+  def embed(texts):
+      # texts 是 list[str]，按同样的顺序返回 list[list[float]]
+      ...
+  ```
+
+- **段的标题和摘要是空的。** 上游就是这样：段是按帧差切的，没有哪一步给它们写标题。所以 `get_macro_events` 和 `search_by_time` 除了时间和主要实体，信息很少，agent 主要靠搜索和 `get_subgraph`。这是一个明显可以改进的地方。
+- **建库只看帧。** 上游可以上传视频片段，Opus 5.5 不收视频，所以这里每段最多 100 帧，看不到连续动作，也听不到非语音的声音。千问公布的带记忆分数不是这样建的，不能当成这里的预期。
+- **转写在记忆里也有一份。** 提示词让 agent 优先用 `search_asr_text`，只在不够时才调 `transcribe_audio`，因为后者会把整份转写放进之后的每一轮。其他提示词没有改，所以它可能还是会调用。
+- **答案不会进记忆。** 建库脚本只读题目条目里视频的位置和长度，不读问题、选项和答案。agent 的沙箱看不到记忆文件，工具在沙箱外的 agent 进程里读。
+- **没验证过的：** 这部分和前面一样只用假模型测过。真实模型建出来的质量、费用和用时，以及它到底能不能提高准确率，都还不知道。

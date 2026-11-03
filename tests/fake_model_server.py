@@ -6,7 +6,8 @@ or results, and more than 20 images when one of them is over 2000 px. Every reje
 ``violations``, so a test can require that a run caused none.
 
 The main agent's replies follow a script chosen by a token in the question text, MODE=... and ANSWER=...
-Each question is told apart by its video path.
+Each question is told apart by its video path. The requests of a video memory build get canned subgraphs
+and hierarchies, about a chef and a pancake.
 """
 
 import base64
@@ -19,6 +20,35 @@ from collections import defaultdict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from PIL import Image
+
+
+MEMORY_SCRIPT = [
+    ("get_summary", {}),
+    ("get_super_events", {}),
+    ("get_macro_events", {}),
+    ("search_by_time", {"start_sec": 0, "end_sec": 10}),
+    ("search_nodes", {"query": "A chef flips a pancake"}),
+    ("get_subgraph", {"macro_id": "macro_0000"}),
+    ("search_ocr_text", {"query": "score"}),
+    ("search_asr_text", {"query": "pancakes"}),
+    ("enumerate_events", {"query": "chef flips pancake"}),
+]
+
+SUBGRAPH = {
+    "micro_events": [{"event_id": "ev_001", "event_type": "cooking", "time_range": [1, 2], "subject": "ent_001", "object": "ent_002",
+                      "action": "flips the pancake", "description": "The chef flips the pancake with a spatula."}],
+    "entities": [{"entity_id": "ent_001", "name": "Chef", "entity_type": "PERSON", "attributes": {"role": "cook"},
+                  "description": "A chef in a white hat.",
+                  "visual_grounding": {"primary_time": "00:01", "primary_time_sec": 1, "distinctive_features": ["white hat"], "spatial_hint": "center"}},
+                 {"entity_id": "ent_002", "name": None, "entity_type": "OBJECT", "attributes": {"type": "food"},
+                  "description": "A golden pancake.", "visual_grounding": {}}],
+    "on_screen_texts": [{"text_id": "ocr_001", "text": "SCORE 12-7", "time_range": [0, 3], "description": "A scoreboard overlay."}],
+    "edges": [{"source_id": "ent_001", "target_id": "ev_001", "relation_label": "USES_TOOL", "relation_type": "SEMANTIC", "description": "uses a spatula"},
+              {"source_id": "ev_001", "target_id": "ent_002", "relation_label": "CAUSES", "relation_type": "CAUSAL", "description": "flipped"}],
+}
+EMPTY_SUBGRAPH = {"micro_events": [], "entities": [], "on_screen_texts": [], "edges": []}
+ROOT = {"title": "A chef at work", "description": "A chef cooks a pancake.", "themes": ["cooking"],
+        "key_entities": ["Chef"], "emotional_tone": "calm"}
 
 
 def _text_of(content):
@@ -89,6 +119,9 @@ class FakeModelServer:
         self.steps = defaultdict(int)
         self.probes = probes or []  # Commands the escape script runs in the sandbox
         self.drop_effort = False  # True acts like a route that loses reasoning_effort
+        self.fail_subgraphs = 0  # So many build requests for a subgraph are refused
+        self.fail_aggregations = 0  # So many build requests for a hierarchy are refused
+        self.empty_subgraphs = False  # Subgraph requests get a valid reply with nothing in it
         outer = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -129,17 +162,24 @@ class FakeModelServer:
         is_main = "execute_bash" in names
         task = " ".join(_text_of(m.get("content")) for m in messages if m.get("role") == "user")
         kind = "main" if is_main and body.get("tool_choice") != "none" else "analysis" if is_main else "orchestrator"
+        if not is_main and "video knowledge-graph annotator" in task:
+            kind = "build_subgraph"
+        elif not is_main and "video narrative analyst" in task:
+            kind = "build_aggregate"
+        system = _text_of(messages[0].get("content")) if messages and messages[0].get("role") == "system" else ""
         with self.lock:
             self.requests.append({
                 "kind": kind, "effort": body.get("reasoning_effort"), "model": body.get("model"),
                 "n_images": len(_image_urls(messages)), "tool_choice": body.get("tool_choice"),
-                "max_tokens": body.get("max_tokens"),
+                "max_tokens": body.get("max_tokens"), "tools": names, "system": system, "task": task,
             })
         problem = violation_in(body)
         if problem:
             with self.lock:
                 self.violations.append(problem)
             return 400, {"error": {"type": "invalid_request_error", "message": problem}}
+        if kind.startswith("build_"):
+            return self.build_turn(kind, task)
         if kind == "analysis":
             return 200, self.reply("I see a test pattern with colored bars.")
         if not is_main and ("submit_answer" in names or "Reply with" in task or "What color" in task):
@@ -151,6 +191,29 @@ class FakeModelServer:
                 return 200, self.reply("", [self.call("read_file", {"path": "/testbed/memory/working_memory.md", "max_chars": len(messages)})])
             return 200, self.reply("## Current Understanding\nA test pattern.\n\n## Key Evidence\n- colored bars\n")
         return self.main_turn(messages, task)
+
+    def build_turn(self, kind, task):
+        """Replies for the requests of a video memory build."""
+        refused = (400, {"error": {"type": "invalid_request_error", "message": "refused by the test"}})
+        with self.lock:
+            if kind == "build_subgraph" and self.fail_subgraphs > 0:
+                self.fail_subgraphs -= 1
+                return refused
+            if kind == "build_aggregate" and self.fail_aggregations > 0:
+                self.fail_aggregations -= 1
+                return refused
+        if kind == "build_subgraph":
+            subgraph = EMPTY_SUBGRAPH if self.empty_subgraphs else SUBGRAPH
+            return 200, self.reply("```json\n" + json.dumps(subgraph) + "\n```")
+        if "chronologically ordered Super Events" in task:
+            return 200, self.reply(json.dumps({"super_relations": [], "root": ROOT}))
+        ids = re.findall(r'"macro_id": "(macro_\d+)"', task)
+        chunks = [ids[i:i + 2] for i in range(0, len(ids), 2)]
+        supers = [{"super_id": f"super_{i:02d}", "label": f"Arc {i}", "description": "Cooking goes on.", "sub_macro_ids": chunk,
+                   "time_range": ["00:00:00", "00:00:10"], "key_entities": [{"name": "Chef", "type": "PERSON"}]}
+                  for i, chunk in enumerate(chunks)]
+        relations = [{"source": ids[0], "target": ids[1], "type": "CAUSES", "reason": "one leads to the next"}] if len(ids) > 1 else []
+        return 200, self.reply(json.dumps({"super_events": supers, "macro_relations": relations, "super_relations": [], "root": ROOT}))
 
     def check_turn(self, body, names, task):
         """Replies for the requests of check_model_endpoint.py."""
@@ -198,6 +261,10 @@ class FakeModelServer:
             return (200, submit) if step >= 6 else (200, self.bash(f"echo step {step}"))
         if mode == "escape":
             return (200, submit) if step >= len(self.probes) else (200, self.bash(self.probes[step]))
+        if mode == "memory":  # Each memory tool once, then the normal script
+            if step < len(MEMORY_SCRIPT):
+                return 200, self.reply("", [self.call(*MEMORY_SCRIPT[step])])
+            step -= len(MEMORY_SCRIPT)
         # The normal script: three rounds of extracting a frame and looking at it, then submit
         n_round, phase = divmod(step, 2)
         if n_round >= 3:

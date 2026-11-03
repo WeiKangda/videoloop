@@ -184,6 +184,18 @@ def get_orchestrated_preamble() -> str:
     return prompts.get("memory_agent", {}).get("orchestrated_preamble", "")
 
 
+def get_video_memory_preamble() -> str:
+    """Get the system prompt section for a video with a built memory."""
+    prompts = get_prompts()
+    return prompts.get("memory_agent", {}).get("video_memory_preamble", "")
+
+
+def get_video_memory_orchestrator_note() -> str:
+    """Get the note telling the orchestrator how far to trust the memory tools."""
+    prompts = get_prompts()
+    return prompts.get("memory_agent", {}).get("video_memory_orchestrator_note", "")
+
+
 def get_early_submit_bounce(reason: str) -> str:
     """Get the early submit bounce message."""
     prompts = get_prompts()

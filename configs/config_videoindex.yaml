@@ -48,6 +48,18 @@ memory:
   fs_context_budget: 16000
   max_key_frames: 6
 
+video_memory:
+  # Off until a run passes --video-memory, see docs/video_index_pilot.md
+  memory_dir: ""
+  # "module:function" for dense search. Empty means BM25 alone
+  embed_backend: ""
+  build_fps: 0.5
+  build_max_dim: 720
+  build_max_frames: 100
+  build_effort: "medium"
+  build_max_output_tokens: 65536
+  build_timeout: 1200
+
 visual_planner:
   enabled: false
   descriptions_dir: dataset/videomme_long/visual_descriptions

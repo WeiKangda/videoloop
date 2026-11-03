@@ -22,6 +22,7 @@ and the options, never the answer field, and its sandbox can see the one video a
 import argparse
 import concurrent.futures
 import hashlib
+import importlib.util
 import json
 import os
 import queue
@@ -38,7 +39,8 @@ ROOT = Path(__file__).resolve().parent.parent
 LETTERS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
 DATA_URL = re.compile(r"data:[\w/+.-]+;base64,[A-Za-z0-9+/=]+")
 DEFAULT_TRANSCRIPTS = "dataset/videoindex_v1_1/transcripts_whisperx"
-CONFIG_KEYS = ("model", "orchestrator_model", "effort", "orchestrator_effort", "timeout", "max_iterations", "config_sha256")
+CONFIG_KEYS = ("model", "orchestrator_model", "effort", "orchestrator_effort", "timeout", "max_iterations", "config_sha256", "video_memory")
+MEMORY_REQUIRED_FROM_S = 1800  # With --video-memory, a video this long must have one. Shorter ones use it if there is one.
 
 
 def item_dir_name(item_id):
@@ -125,6 +127,7 @@ def run_child(a, item, item_dir):
     cfg.sandbox.work_root = str(item_dir / "sandbox")
     cfg.sandbox.cpuset_cpus = a.slot or None
     cfg.sandbox.container_name = container_name(item["item_id"])
+    cfg.video_memory.memory_dir = a.video_memory
     transcript_cache._EXTRA_CACHE_DIRS.insert(0, Path(a.transcripts))
 
     usage_log = open(item_dir / "usage.jsonl", "a", encoding="utf-8", buffering=1)
@@ -149,6 +152,7 @@ def run_child(a, item, item_dir):
         "answer_source": result.answer_source,
         "reasoning": result.reasoning,
         "error": result.error,
+        "video_memory": agent._video_memory is not None,
         "orchestrator_calls_made": getattr(orchestrator, "calls_made", None),
         "orchestrator_calls_failed": getattr(orchestrator, "calls_failed", None),
     })
@@ -238,6 +242,7 @@ def run_question(a, item, slot, running):
         "reasoning": None if timed_out else child.get("reasoning"),
         "wall_s": round(wall_s, 1),
         "slot": slot or "",
+        "video_memory": child.get("video_memory", False),
         "orchestrator_calls_made": child.get("orchestrator_calls_made"),
         "orchestrator_calls_failed": child.get("orchestrator_calls_failed"),
         "usage": summarize_usage(jsonl_rows(item_dir / "usage.jsonl")),
@@ -263,11 +268,23 @@ def select_items(ap, a, items):
         if unknown:
             ap.error(f"--only: no such item: {unknown[0]}")
         items = [i for i in items if i["item_id"] in set(wanted)]
+    if a.min_duration:
+        items = [i for i in items if i["duration_s"] >= a.min_duration]
     return items[:a.limit] if a.limit else items
 
 
+def memory_ready(memory_dir, video_name):
+    """Whether scripts/build_video_memory.py finished this video."""
+    folder = os.path.join(memory_dir, os.path.splitext(video_name)[0])
+    stats = os.path.join(folder, "build_stats.json")
+    if not os.path.exists(stats):
+        return False
+    with open(stats, encoding="utf-8") as f:
+        return json.load(f).get("status") == "done"
+
+
 def check_inputs(a, items):
-    """Problems that would waste a run, as strings: missing videos and transcripts."""
+    """Problems that would waste a run, as strings: missing videos, transcripts and memories."""
     problems = []
     for item in items:
         name = os.path.basename(item["video"])
@@ -276,6 +293,9 @@ def check_inputs(a, items):
         transcript = os.path.join(a.transcripts, os.path.splitext(name)[0] + ".json")
         if not os.path.exists(transcript) and not a.allow_missing_transcripts:
             problems.append(f"{item['item_id']}: no transcript in {a.transcripts}")
+        has_frames = item.get("width") is not None
+        if a.video_memory and has_frames and item["duration_s"] >= MEMORY_REQUIRED_FROM_S and not memory_ready(a.video_memory, name):
+            problems.append(f"{item['item_id']}: no finished memory in {a.video_memory}")
     return problems
 
 
@@ -308,6 +328,7 @@ def run_config(a):
         "orchestrator_effort": a.orchestrator_effort,
         "timeout": a.timeout,
         "max_iterations": a.max_iterations,
+        "video_memory": a.video_memory or None,
         "config": a.config,
         "config_sha256": config_sha256,
         "commit": head,
@@ -320,8 +341,9 @@ def dry_run(a, items):
     for item in items:
         done = (Path(a.out) / item_dir_name(item["item_id"]) / "result.json").exists()
         audio_only = " audio-only" if item.get("width") is None else ""
+        memory = " memory" if a.video_memory and memory_ready(a.video_memory, os.path.basename(item["video"])) else ""
         print(f"{'kept' if done else 'run '} {item['item_id']} {len(item['options'])} options "
-              f"{item['duration_s']:.0f}s{audio_only}")
+              f"{item['duration_s']:.0f}s{audio_only}{memory}")
     if a.runtime == "bwrap" and items:
         from video_agent.bwrap_runtime import BwrapRuntime
         video = os.path.join(a.videos, os.path.basename(items[0]["video"]))
@@ -345,6 +367,7 @@ def main():
     ap.add_argument("--orchestrator-effort", default="", help="default: from the config")
     ap.add_argument("--config", default=str(ROOT / "configs" / "config_videoindex.yaml"))
     ap.add_argument("--transcripts", default=str(ROOT / DEFAULT_TRANSCRIPTS))
+    ap.add_argument("--video-memory", default="", help="folder from scripts/build_video_memory.py; a video with a memory there gets the memory tools")
     ap.add_argument("--env-prefix", default="", help="Python environment for the sandbox's shell (bwrap)")
     ap.add_argument("--extra-ro-bind", action="append", default=[], help="SRC[:DST] mounted read-only (bwrap)")
     ap.add_argument("--timeout", type=int, default=3600, help="seconds per question")
@@ -352,6 +375,7 @@ def main():
     ap.add_argument("--workers", type=int, default=1)
     ap.add_argument("--cpu-slots", default="", help="'LIST;LIST;...': one taskset CPU list per question running at a time (replaces --workers)")
     ap.add_argument("--only", default="", help="comma-separated item ids")
+    ap.add_argument("--min-duration", type=float, default=0, help="only videos at least this many seconds long")
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--allow-missing-transcripts", action="store_true")
     ap.add_argument("--retry-errors", action="store_true", help="run questions again whose status is error or crashed, except a request too large for the model; for outages such as expired credentials")
@@ -365,6 +389,7 @@ def main():
     a.videos = str(Path(a.videos).resolve())
     a.transcripts = str(Path(a.transcripts).resolve())
     a.env_prefix = str(Path(a.env_prefix).resolve()) if a.env_prefix else ""
+    a.video_memory = str(Path(a.video_memory).resolve()) if a.video_memory else ""
 
     items = load_items(a.items)
     if a.child:
@@ -383,7 +408,10 @@ def main():
     problems = check_inputs(a, items)
     if problems:
         print("\n".join(problems[:20]), file=sys.stderr)
-        ap.error(f"{len(problems)} input problems; for transcripts, run scripts/transcribe_videoindex.py")
+        ap.error(f"{len(problems)} input problems; for transcripts, run scripts/transcribe_videoindex.py; "
+                 "for memories, run scripts/build_video_memory.py")
+    if a.video_memory and not importlib.util.find_spec("numpy"):
+        ap.error('--video-memory needs numpy: pip install -e ".[video-memory]"')
     if a.runtime == "bwrap" and not a.dry_run and not shutil.which("bwrap"):
         ap.error("bwrap is not installed")
     slots = [s.strip() for s in a.cpu_slots.split(";") if s.strip()]
@@ -422,7 +450,7 @@ def main():
                      "--max-iterations", str(a.max_iterations), "--config", a.config]
     for flag, value in (("--orchestrator-model", a.orchestrator_model), ("--api-base", a.api_base),
                         ("--effort", a.effort), ("--orchestrator-effort", a.orchestrator_effort),
-                        ("--env-prefix", a.env_prefix)):
+                        ("--env-prefix", a.env_prefix), ("--video-memory", a.video_memory)):
         if value:
             a.passthrough += [flag, value]
     for spec in a.extra_ro_bind:

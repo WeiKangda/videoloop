@@ -1,8 +1,11 @@
+# Modified from upstream VideoLoop for the Video-Index pilot; see docs/video_index_pilot.md.
 """
 Tool definitions for the Video Understanding Agent
 """
 
 from typing import Dict, Any, List
+
+from .video_memory.tool_schemas import VIDEO_MEMORY_TOOLS, VIDEO_MEMORY_TOOL_NAMES
 
 # ==============================================================================
 # VIDEO ANALYSIS TOOLS
@@ -343,11 +346,13 @@ def get_all_tools(max_images: int = 32, exclude_tools: list = None, include_tool
     Args:
         include_tools: If non-empty, only these tool names are included (whitelist).
         exclude_tools: Tool names to exclude (ignored when include_tools is set).
+
+    Video memory tools only come by name in include_tools: the agent adds them for a video with a built memory.
     """
     include = set(include_tools) if include_tools else None
-    exclude = set(exclude_tools or [])
+    exclude = set(exclude_tools or []) | set(VIDEO_MEMORY_TOOL_NAMES)
     tools = []
-    for tool in ALL_TOOLS:
+    for tool in ALL_TOOLS + VIDEO_MEMORY_TOOLS:
         name = tool.get("function", {}).get("name") or tool.get("name", "")
         if include is not None:
             if name not in include:
@@ -412,7 +417,8 @@ def _gemini_schema(schema: dict) -> dict:
 def format_tools_for_gemini(max_images: int = 32, exclude_tools: list = None, include_tools: list = None) -> list:
     """Format tools for Gemini native API (functionDeclarations)."""
     declarations = [
-        {"name": n, "description": d, "parameters": _gemini_schema(p)}
+        # A tool with no arguments has no parameters: Gemini refuses an object schema with no properties
+        {"name": n, "description": d, **({"parameters": _gemini_schema(p)} if p.get("properties") else {})}
         for n, d, p in (_normalize_tool(t) for t in get_all_tools(max_images, exclude_tools=exclude_tools, include_tools=include_tools))
     ]
     return [{"functionDeclarations": declarations}]

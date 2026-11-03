@@ -474,6 +474,45 @@ def _pin_memory(agent, input_data):
 
 
 # ---------------------------------------------------------------------------
+# Video memory tools (offered only for a video with a built memory)
+# ---------------------------------------------------------------------------
+
+_VIDEO_MEMORY_CALLS = {
+    "get_summary": lambda m, a: m.get_summary(),
+    "get_super_events": lambda m, a: m.get_super_events(),
+    "get_macro_events": lambda m, a: m.get_macro_events(super_id=a.get("super_id") or "", macro_ids=a.get("macro_ids")),
+    "get_subgraph": lambda m, a: m.get_subgraph(a.get("macro_id", "")),
+    "search_nodes": lambda m, a: m.search_nodes(query=a.get("query", ""), top_k=int(a.get("top_k", 10)), node_types=a.get("node_types")),
+    "search_ocr_text": lambda m, a: m.search_ocr_text(query=a.get("query", ""), top_k=int(a.get("top_k", 10))),
+    "search_asr_text": lambda m, a: m.search_asr_text(query=a.get("query", ""), top_k=int(a.get("top_k", 10))),
+    "search_by_time": lambda m, a: m.search_by_time(
+        start_sec=float(a.get("start_sec", 0)), end_sec=float(a.get("end_sec", 600)),
+        start_time=a.get("start_time"), end_time=a.get("end_time"),
+    ),
+    "enumerate_events": lambda m, a: m.enumerate_events(
+        query=a.get("query", ""), min_cosine=float(a.get("min_cosine", 0.5)),
+        max_results=int(a.get("max_results", 120)), node_types=a.get("node_types"),
+    ),
+}
+
+
+def _register_video_memory_tool(name, call):
+    @_register(name)
+    def handler(agent, input_data):
+        memory = getattr(agent, "_video_memory", None)
+        if memory is None:
+            return "Error: this video has no memory."
+        try:
+            return call(memory, input_data)
+        except (TypeError, ValueError) as e:  # A bad argument, such as a malformed timestamp, which the model can fix
+            return f"Error: {e}"
+
+
+for _name, _call in _VIDEO_MEMORY_CALLS.items():
+    _register_video_memory_tool(_name, _call)
+
+
+# ---------------------------------------------------------------------------
 # Visual planner todo tools
 # ---------------------------------------------------------------------------
 

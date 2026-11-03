@@ -233,6 +233,43 @@ memory_agent:
 
     Your NEXT tool call MUST be analyze_frames, transcribe_audio, or execute_bash. NOT submit_answer.
 
+  # Only for a video with a built memory. The workflow is from Qwen-MM-Plugins' video-memory skill.
+  video_memory_preamble: |
+    <VIDEO_MEMORY>
+    This video has a pre-built memory, made ahead of time from its frames and transcript without knowing the question:
+
+      Root (1 per video)
+        └─ SuperEvent (story arcs)
+             └─ MacroEvent (scenes, each with a time range)
+                  └─ Subgraph (entities, timestamped events, on-screen text, relations)
+
+    The memory covers the whole video, so use it INSTEAD of the coarse grid of frames described above. Do not extract a coarse grid over the whole video.
+
+    Most questions follow three steps:
+    1. Locate the right macro_id. Choose ONE entry point:
+       - A specific time: search_by_time
+       - A person, action or event: search_nodes
+       - On-screen text, scores, names: search_ocr_text
+       - Something spoken: search_asr_text
+       - A known story segment: get_super_events, then get_macro_events
+       - "How many" or "list every occurrence": enumerate_events
+    2. Drill down. Call get_subgraph on the 1-2 most relevant macro_ids. The detail is in the subgraph, not in the summaries.
+    3. Verify with frames. Extract frames from that narrow time range with execute_bash + ffmpeg and look at them with analyze_frames. The memory is coarse and may be inaccurate, so never answer from it alone.
+
+    Common mistakes:
+    - Answering from a SuperEvent description. These are summaries; get the subgraph.
+    - Repeating similar searches. If search_nodes found macro_0022, call get_subgraph on macro_0022 instead of searching with a slightly different query.
+    - Staying with one index. If search_nodes gives poor results, try search_ocr_text, search_asr_text or search_by_time. They cover different content.
+    - Guessing counts. For "how many" questions, count from the explicit node list. Never estimate from words like "several".
+
+    For speech, search_asr_text counts as transcript evidence. transcribe_audio puts the whole transcript into every later turn, which is large on a long video, so call it only if search_asr_text can't settle the point.
+    </VIDEO_MEMORY>
+
+  video_memory_orchestrator_note: >-
+    The tools get_summary, get_super_events, get_macro_events, get_subgraph, search_nodes, search_ocr_text, search_asr_text,
+    search_by_time and enumerate_events read a summary of the video built ahead of time, which can be wrong.
+    Record what they return as leads to verify against frames, not as confirmed evidence.
+
 # ==============================================================================
 # MEMORY SUMMARIZER (Query-Aware LLM Summarization)
 # ==============================================================================

@@ -44,9 +44,13 @@ dev = [
     "pytest>=8.0",
     "ruff>=0.4",
 ]
+video-memory = [
+    "numpy<3",
+    "opencv-python-headless",
+]
 
 [project.urls]
 Repository = "https://github.com/philipxjm/videoloop"
 
 [tool.setuptools]
-packages = ["video_agent", "video_agent.memory"]
+packages = ["video_agent", "video_agent.memory", "video_agent.video_memory"]

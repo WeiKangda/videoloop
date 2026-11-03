@@ -2,7 +2,7 @@
 """Score a run_videoindex.py run, and compare it with another run question by question.
 
   python scripts/score_videoindex.py --run results/videoindex/run1 --items data/items_test.jsonl \
-      [--baseline BASELINE/sessions.csv] [--transcripts DIR] [--prices 4,5,0.2,20]
+      [--baseline BASELINE/sessions.csv] [--transcripts DIR] [--video-memory DIR] [--prices 4,5,0.2,20]
 
 Writes <run>/sessions.csv and <run>/summary.md, and prints the summary. Standard library only.
 
@@ -21,6 +21,10 @@ only on questions where both finished, because a run killed at its limit has no 
 --prices is input,cache write,cache read,output in dollars per million tokens. The default is the list price
 of Claude Opus 5.5. Every input token that wasn't reported as cached is billed at the input price, so a model
 call whose gateway reports no cache fields is billed in full.
+
+--video-memory is the folder from build_video_memory.py. The cost and time of building a video's memory are not
+in cost_usd and wall_s, which cover the question alone. They are in build_cost_usd and build_wall_s, and added in
+cost_with_build_usd and wall_with_build_s. Each video here has one question, so the build falls on that question.
 """
 
 import argparse
@@ -37,6 +41,8 @@ from collections import Counter
 BINS = ["<1 min", "1-10 min", "10-60 min", ">=60 min"]
 BOOTSTRAP = 2000
 ANSWERED_SOURCES = {"submit", "forced_submit", "text"}
+MEMORY_TOOLS = {"get_summary", "get_super_events", "get_macro_events", "get_subgraph", "search_nodes",
+                "search_ocr_text", "search_asr_text", "search_by_time", "enumerate_events"}
 
 
 def duration_bin(s):
@@ -82,7 +88,8 @@ def cost_of(usage, prices):
     return (uncached * p_in + write * p_write + read * p_read + usage.get("output_tokens", 0) * p_out) / 1e6
 
 
-def score_session(item, result, prices, asr_s=None):
+def score_session(item, result, prices, asr_s=None, build=None):
+    """One row of sessions.csv. build is the build_stats.json of the memory this question used."""
     letter = parse_letter(result.get("answer"), len(item["options"]))
     kind = no_answer_kind(result, letter)
     correct = not kind and letter == item["answer"]
@@ -91,6 +98,11 @@ def score_session(item, result, prices, asr_s=None):
               for k in ("input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens")}
     main = usage.get("main_agent", {})
     other = [u for tag, u in usage.items() if tag != "main_agent"]
+    cost = sum(cost_of(u, prices) for u in usage.values())
+    build_cost = sum(cost_of(u, prices) for u in build["usage"].values()) if build else 0.0
+    build_wall = build["wall_s"] if build else 0.0
+    wall = result.get("wall_s")
+    tools = result.get("tool_calls") or {}
     return {
         "item_id": item["item_id"],
         "benchmark": item.get("benchmark", ""),
@@ -104,7 +116,7 @@ def score_session(item, result, prices, asr_s=None):
         "no_answer_kind": kind,
         "answer": letter or "",
         "answer_source": result.get("answer_source") or "",
-        "cost_usd": round(sum(cost_of(u, prices) for u in usage.values()), 4),
+        "cost_usd": round(cost, 4),
         "cost_main_usd": round(cost_of(main, prices), 4),
         "cost_orchestrator_usd": round(sum(cost_of(u, prices) for u in other), 4),
         "wall_s": result.get("wall_s"),
@@ -119,6 +131,12 @@ def score_session(item, result, prices, asr_s=None):
         "main_calls": main.get("calls", 0),
         "orchestrator_calls": sum(u.get("calls", 0) for u in other),
         "failed_calls": sum(u.get("failed_calls", 0) for u in usage.values()),
+        "video_memory": int(bool(result.get("video_memory"))),
+        "n_memory_calls": sum(tools.get(t, 0) for t in MEMORY_TOOLS),
+        "build_cost_usd": round(build_cost, 4) if build else "",
+        "build_wall_s": build_wall if build else "",
+        "cost_with_build_usd": round(cost + build_cost, 4),
+        "wall_with_build_s": round(wall + build_wall, 1) if wall is not None else "",
     }
 
 
@@ -188,6 +206,19 @@ def summarize_run(rows):
     if asr:
         out += ["", f"ASR, done ahead of the run and not in wall time: {sum(asr) / 3600:.1f} h in all, "
                     f"median {statistics.median(asr):.0f}s per question."]
+    used = [r for r in rows if int(r["video_memory"])]
+    if used:
+        built = [r for r in used if number(r, "build_cost_usd") is not None]
+        calls = sum(int(r["n_memory_calls"]) for r in used)
+        out += ["", f"Video memory: {len(used)} questions used one, with {calls} memory tool calls."]
+        if built:
+            out += [f"Building them, ahead of the run and not in the cost or wall time above: {len(built)} videos, "
+                    f"${sum(float(r['build_cost_usd']) for r in built):,.2f} and "
+                    f"{sum(float(r['build_wall_s']) for r in built) / 3600:.1f} h in all, "
+                    f"median ${med(built, 'build_cost_usd'):,.2f} and {med(built, 'build_wall_s'):,.0f}s per video.",
+                    f"With the build, all {len(rows)} questions cost ${sum(float(r['cost_with_build_usd']) for r in rows):,.2f}."]
+        if len(built) < len(used):
+            out += [f"**{len(used) - len(built)} questions used a memory whose build isn't counted: pass --video-memory.**"]
     out += ["", "By video length:", ""]
     out += table(["length", "n", "correct %", "no answer", "median cost ($)", "median wall (s)"], [
         [b, len(g), f"{accuracy(g):.1f}", sum(int(r["no_answer"]) for r in g), fmt(med(g, "cost_usd")), fmt(med(g, "wall_s"), 0)]
@@ -225,8 +256,14 @@ def compare(rows, base):
     finished = [(b, r) for b, r in pairs if not int(b["no_answer"]) and not int(r["no_answer"])]
     out += ["", f"Finished in both: {len(finished)} questions.", ""]
     metric_rows = []
-    for label, field in (("cost ($)", "cost_usd"), ("wall time (s)", "wall_s"), ("tool calls", "n_tool_calls"), ("images", "n_read_image")):
-        valid = [(number(b, field), number(r, field)) for b, r in finished]
+    metrics = [("cost ($)", "cost_usd", "cost_usd"), ("wall time (s)", "wall_s", "wall_s"),
+               ("tool calls", "n_tool_calls", "n_tool_calls"), ("images", "n_read_image", "n_read_image")]
+    if any(number(r, "build_cost_usd") is not None for r in run_rows):
+        metrics += [("cost with memory build ($)", "cost_with_build_usd", "cost_usd"),
+                    ("wall time with memory build (s)", "wall_with_build_s", "wall_s")]
+    for label, field, plain_field in metrics:
+        # A baseline from elsewhere has no with-build columns, and none of its cost is a build.
+        valid = [(number(b, field) if number(b, field) is not None else number(b, plain_field), number(r, field)) for b, r in finished]
         valid = [(x, y) for x, y in valid if x is not None and y is not None]
         if not valid:
             continue
@@ -260,6 +297,7 @@ def main():
     ap.add_argument("--items", required=True)
     ap.add_argument("--baseline", help="a CSV with item_id, correct and no_answer, paired by question")
     ap.add_argument("--transcripts", help="folder of transcripts, to report ASR time")
+    ap.add_argument("--video-memory", help="folder from build_video_memory.py, to report the cost of building")
     ap.add_argument("--prices", default="4,5,0.2,20", help="input,cache write,cache read,output, $ per million tokens")
     a = ap.parse_args()
     prices = [float(x) for x in a.prices.split(",")]
@@ -279,7 +317,13 @@ def main():
             if os.path.exists(transcript):
                 with open(transcript, encoding="utf-8") as f:
                     asr_s = json.load(f).get("elapsed_s")
-        rows.append(score_session(item, result, prices, asr_s))
+        build = None
+        if a.video_memory and result.get("video_memory"):
+            stats = os.path.join(a.video_memory, os.path.splitext(os.path.basename(item["video"]))[0], "build_stats.json")
+            if os.path.exists(stats):
+                with open(stats, encoding="utf-8") as f:
+                    build = json.load(f)
+        rows.append(score_session(item, result, prices, asr_s, build))
     if not rows:
         ap.error(f"no result.json under {a.run}")
 

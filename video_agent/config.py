@@ -96,6 +96,19 @@ class MemoryConfig:
 
 
 @dataclass
+class VideoMemoryConfig:
+    """Hierarchical video memory from Qwen-MM-Plugins; see video_agent/video_memory/README.md."""
+    memory_dir: str = ""  # Folder of <video stem>/graph_memory.json ("" = off); run_videoindex.py --video-memory sets it
+    embed_backend: str = ""  # "module:function" for dense search ("" = BM25 alone); env VIDEOLOOP_EMBED_BACKEND wins
+    build_fps: float = 0.5  # Frames per second sent to the model when building
+    build_max_dim: int = 720  # Frame width in pixels
+    build_max_frames: int = 100  # Frames per segment; Claude takes at most 100 images in a request
+    build_effort: str = "medium"  # reasoning_effort of the build's model calls
+    build_max_output_tokens: int = 65536
+    build_timeout: int = 1200  # Seconds per model call
+
+
+@dataclass
 class AgentPricing:
     input_per_million: float = 0.0
     output_per_million: float = 0.0
@@ -124,6 +137,7 @@ class AgentConfig:
     llm: LLMConfig = field(default_factory=LLMConfig)
     sandbox: SandboxConfig = field(default_factory=SandboxConfig)
     memory: MemoryConfig = field(default_factory=MemoryConfig)
+    video_memory: VideoMemoryConfig = field(default_factory=VideoMemoryConfig)
     pricing: PricingConfig = field(default_factory=PricingConfig)
     visual_planner: VisualPlannerConfig = field(default_factory=VisualPlannerConfig)
     include_tools: List[str] = field(default_factory=list)  # Whitelist of tool names; empty = all tools
@@ -154,6 +168,7 @@ class AgentConfig:
         llm = LLMConfig(**data.get("llm", {}))
         sandbox = SandboxConfig(**data.get("sandbox", {}))
         memory = MemoryConfig(**data.get("memory", {}))
+        video_memory = VideoMemoryConfig(**data.get("video_memory", {}))
         pricing_data = data.get("pricing", {})
         vlm_pricing = AgentPricing(**pricing_data.pop("vlm", {}))
         summarizer_pricing = AgentPricing(**pricing_data.pop("summarizer", {}))
@@ -174,6 +189,7 @@ class AgentConfig:
             llm=llm,
             sandbox=sandbox,
             memory=memory,
+            video_memory=video_memory,
             pricing=pricing,
             visual_planner=visual_planner,
             include_tools=include_tools,
